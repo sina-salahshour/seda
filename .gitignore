@@ -1,4 +1,24 @@
+# Rust
 /app/target/
+
+# Python
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+/sidecar/dist/
+/sidecar/build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local data and secrets (SEDA_DATA pointed into the repo, sidecar logs)
+.env
+*.log
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
