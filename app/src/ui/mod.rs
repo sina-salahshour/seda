@@ -4,5 +4,6 @@
 
 pub mod chats;
 pub mod common;
+pub mod models;
 pub mod settings;
 pub mod voices;

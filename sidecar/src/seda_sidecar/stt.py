@@ -21,9 +21,13 @@ _BATCH = 4
 
 
 class WhisperSTT:
-    def __init__(self, model_id: str = config.WHISPER_MODEL, language: str = "fa"):
-        self.model_id = model_id
+    def __init__(self, model_id: str = config.WHISPER_MODEL, language: str = "fa",
+                 generate_kwargs: dict | None = None):
+        self.model_id = model_id  # repo id or local dir (see models.stt_path)
+        self.catalog_id: str | None = None  # model id in the catalog / "local:..." (set by manager)
         self.language = language
+        self.generate_kwargs = dict(generate_kwargs or {})
+        self._lang_kwargs: dict = {}
         self.model = None
         self.processor = None
         self.device: str | None = None
@@ -50,6 +54,12 @@ class WhisperSTT:
             self.model_id, dtype=dtype, attn_implementation="sdpa", low_cpu_mem_usage=True
         )
         model.to(device).eval()
+        # Fine-tunes with a replaced tokenizer may bake language/task into their
+        # generation config and drop lang_to_id; only force fa when it is known.
+        lang_ids = getattr(model.generation_config, "lang_to_id", None) or {}
+        self._lang_kwargs = (
+            {"language": self.language, "task": "transcribe"} if f"<|{self.language}|>" in lang_ids else {}
+        )
         self.model, self.device, self.dtype = model, device, dtype
         if device.startswith("cuda"):
             # The first CUDA generate() pays ~15 s of one-time kernel setup; do it now.
@@ -102,10 +112,5 @@ class WhisperSTT:
         mask = feats.get("attention_mask")
         kwargs = {"attention_mask": mask.to(self.device)} if mask is not None else {}
         with torch.inference_mode():
-            ids = self.model.generate(
-                inputs,
-                language=self.language,
-                task="transcribe",
-                **kwargs,
-            )
+            ids = self.model.generate(inputs, **self._lang_kwargs, **self.generate_kwargs, **kwargs)
         return self.processor.batch_decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)

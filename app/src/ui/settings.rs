@@ -3,7 +3,8 @@
 
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
-    button::Button,
+    button::{Button, ButtonVariant, ButtonVariants as _},
+    dialog::DialogFooter,
     form::{Field, Form},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
@@ -14,6 +15,8 @@ use gpui_kit::component::{
     switch::Switch,
     v_flex,
 };
+use gpui_kit::assets::IconName;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, SharedString, Styled as _, Subscription, Window, div, px,
@@ -21,7 +24,7 @@ use gpui_kit::{
 
 use crate::rtl;
 use crate::sidecar::{SidecarClient, SidecarGlobal, SidecarStatus};
-use crate::store::{AppSettings, PermissionMode, Settings, ThemePreference, data_dir};
+use crate::store::{AppSettings, Endpoint, PermissionMode, Settings, ThemePreference, data_dir};
 use crate::ui::common::page_header;
 
 /// A labelled `Select` choice with a typed value.
@@ -51,6 +54,10 @@ pub struct SettingsPage {
     ollama_url: Entity<InputState>,
     claude_bin: Entity<InputState>,
     system_prompt: Entity<TextareaState>,
+    opencode_bin: Entity<InputState>,
+    agent_prompt: Entity<TextareaState>,
+    claude_model: Entity<SelectState<Vec<Choice<Option<String>>>>>,
+    claude_effort: Entity<SelectState<Vec<Choice<Option<String>>>>>,
     permission: Entity<SelectState<Vec<Choice<PermissionMode>>>>,
     speed: Entity<SelectState<Vec<Choice<u32>>>>,
     input_device: Entity<SelectState<Vec<Choice<Option<String>>>>>,
@@ -106,6 +113,13 @@ impl SettingsPage {
             cx,
         );
 
+        let opencode_bin = text_input(
+            settings.opencode_bin.clone(),
+            |s, v| s.opencode_bin = v.trim().to_string(),
+            window,
+            cx,
+        );
+
         let system_prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(3, 8)
@@ -121,6 +135,94 @@ impl SettingsPage {
                 }
             },
         ));
+
+        let agent_prompt = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(3, 10)
+                .default_value(settings.agent_prompt.clone())
+        });
+        subscriptions.push(cx.subscribe_in(
+            &agent_prompt,
+            window,
+            |_, state, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = state.read(cx).value().to_string();
+                    AppSettings::update(cx, |s| s.agent_prompt = value);
+                }
+            },
+        ));
+
+        let mut optional_select = |choices: Vec<(&'static str, &'static str)>,
+                                   default_label: &'static str,
+                                   current: Option<String>,
+                                   apply: fn(&mut Settings, Option<String>),
+                                   window: &mut Window,
+                                   cx: &mut Context<Self>| {
+            let mut items = vec![Choice {
+                value: None,
+                label: default_label.into(),
+            }];
+            items.extend(choices.into_iter().map(|(value, label)| Choice {
+                value: Some(value.to_string()),
+                label: label.into(),
+            }));
+            if let Some(current) = &current
+                && !items.iter().any(|c| c.value.as_ref() == Some(current))
+            {
+                items.push(Choice {
+                    value: Some(current.clone()),
+                    label: current.clone().into(),
+                });
+            }
+            let ix = items.iter().position(|c| c.value == current).unwrap_or(0);
+            let state = cx.new(|cx| {
+                SelectState::new(
+                    items,
+                    Some(gpui_kit::component::IndexPath::new(ix)),
+                    window,
+                    cx,
+                )
+            });
+            subscriptions.push(cx.subscribe_in(
+                &state,
+                window,
+                move |_, _, event: &SelectEvent<Vec<Choice<Option<String>>>>, _, cx| {
+                    let SelectEvent::Confirm(Some(value)) = event else {
+                        return;
+                    };
+                    let value = value.clone();
+                    AppSettings::update(cx, |s| apply(s, value));
+                },
+            ));
+            state
+        };
+        let claude_model = optional_select(
+            vec![
+                ("fable", "fable"),
+                ("opus", "opus"),
+                ("sonnet", "sonnet"),
+                ("haiku", "haiku"),
+            ],
+            "پیش‌فرض CLI",
+            settings.default_claude_model.clone(),
+            |s, v| s.default_claude_model = v,
+            window,
+            cx,
+        );
+        let claude_effort = optional_select(
+            vec![
+                ("low", "کم — low"),
+                ("medium", "متوسط — medium"),
+                ("high", "زیاد — high"),
+                ("xhigh", "خیلی زیاد — xhigh"),
+                ("max", "بیشینه — max"),
+            ],
+            "پیش‌فرض",
+            settings.default_claude_effort.clone(),
+            |s, v| s.default_claude_effort = v,
+            window,
+            cx,
+        );
 
         let permission_choices: Vec<Choice<PermissionMode>> = PermissionMode::ALL
             .iter()
@@ -251,6 +353,10 @@ impl SettingsPage {
             ollama_url,
             claude_bin,
             system_prompt,
+            opencode_bin,
+            agent_prompt,
+            claude_model,
+            claude_effort,
             permission,
             speed,
             input_device,
@@ -281,6 +387,217 @@ impl SettingsPage {
             });
         })
         .detach();
+    }
+
+    fn confirm_remove_endpoint(endpoint: &Endpoint, window: &mut Window, cx: &mut Context<Self>) {
+        let id = endpoint.id.clone();
+        let name = endpoint.name.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let id = id.clone();
+            alert
+                .title(format!("سرویس «{name}» حذف شود؟"))
+                .description("گفتگوهای قبلی که از این سرویس استفاده می‌کردند دیگر پاسخ نمی‌دهند.")
+                .confirm()
+                .ok_text("حذف سرویس")
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text("انصراف")
+                .on_ok(move |_, _, cx| {
+                    let id = id.clone();
+                    AppSettings::update(cx, |s| s.endpoints.retain(|e| e.id != id));
+                    true
+                })
+        });
+    }
+
+    /// Add (`None`) or edit an OpenAI-compatible endpoint.
+    fn open_endpoint_dialog(
+        existing: Option<Endpoint>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let make = |value: String, placeholder: &'static str, masked: bool, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .masked(masked)
+                    .default_value(value)
+            })
+        };
+        let name = make(
+            existing.as_ref().map(|e| e.name.clone()).unwrap_or_default(),
+            "مثلاً OpenRouter",
+            false,
+            window,
+            cx,
+        );
+        let base_url = make(
+            existing.as_ref().map(|e| e.base_url.clone()).unwrap_or_default(),
+            "https://api.openai.com/v1",
+            false,
+            window,
+            cx,
+        );
+        let api_key = make(
+            existing.as_ref().and_then(|e| e.api_key.clone()).unwrap_or_default(),
+            "اختیاری",
+            true,
+            window,
+            cx,
+        );
+        let model = make(
+            existing.as_ref().and_then(|e| e.default_model.clone()).unwrap_or_default(),
+            "اختیاری",
+            false,
+            window,
+            cx,
+        );
+        name.update(cx, |input, cx| input.focus(window, cx));
+        let editing = existing.is_some();
+        let existing_id = existing.map(|e| e.id);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (name, base_url, api_key, model) =
+                (name.clone(), base_url.clone(), api_key.clone(), model.clone());
+            let existing_id = existing_id.clone();
+            let field = |label: &'static str, input: Input, ltr: bool| {
+                let input = if ltr {
+                    div().ltr().w_full().child(input)
+                } else {
+                    div().w_full().child(input)
+                };
+                v_flex()
+                    .gap_1()
+                    .child(div().text_sm().child(label))
+                    .child(input)
+            };
+            dialog
+                .title(if editing { "ویرایش سرویس" } else { "افزودن سرویس" })
+                .w(px(460.))
+                .close_button(false)
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(field("نام", rtl::input(&name, cx), false))
+                        .child(field("نشانی پایه", Input::new(&base_url), true))
+                        .child(field("کلید API", Input::new(&api_key), true))
+                        .child(field("مدل پیش‌فرض", Input::new(&model), true)),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("endpoint-cancel")
+                                .outline()
+                                .label("انصراف")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("endpoint-save")
+                                .primary()
+                                .label("ذخیره")
+                                .on_click(move |_, window, cx| {
+                                    let name = name.read(cx).value().trim().to_string();
+                                    let url = base_url
+                                        .read(cx)
+                                        .value()
+                                        .trim()
+                                        .trim_end_matches('/')
+                                        .to_string();
+                                    if name.is_empty() || url.is_empty() {
+                                        window.push_notification(
+                                            Notification::error("نام و نشانی پایه لازم است."),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    let non_empty = |v: String| {
+                                        let v = v.trim().to_string();
+                                        (!v.is_empty()).then_some(v)
+                                    };
+                                    let api_key = non_empty(api_key.read(cx).value().to_string());
+                                    let default_model = non_empty(model.read(cx).value().to_string());
+                                    let existing_id = existing_id.clone();
+                                    AppSettings::update(cx, |s| {
+                                        let id = existing_id
+                                            .clone()
+                                            .unwrap_or_else(crate::store::new_id);
+                                        let endpoint = Endpoint {
+                                            id: id.clone(),
+                                            name,
+                                            base_url: url,
+                                            api_key,
+                                            default_model,
+                                        };
+                                        match s.endpoints.iter_mut().find(|e| e.id == id) {
+                                            Some(slot) => *slot = endpoint,
+                                            None => s.endpoints.push(endpoint),
+                                        }
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn endpoint_row(endpoint: &Endpoint, cx: &Context<Self>) -> gpui_kit::Div {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let edit_target = endpoint.clone();
+        let remove_target = endpoint.clone();
+        let mut details = v_flex().flex_1().min_w_0().gap_0p5().child(
+            div()
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .child(endpoint.name.clone()),
+        );
+        details = details.child(
+            div()
+                .ltr()
+                .text_sm()
+                .text_color(muted)
+                .child(endpoint.base_url.clone()),
+        );
+        let mut meta = h_flex().gap_2().text_xs().text_color(muted);
+        if let Some(model) = &endpoint.default_model {
+            meta = meta.child(div().ltr().child(model.clone()));
+        }
+        if endpoint.api_key.is_some() {
+            meta = meta.child(
+                h_flex()
+                    .gap_1()
+                    .child(gpui_kit::component::Icon::new(IconName::KeyRound).size_3())
+                    .child("کلید تنظیم شده · ••••••"),
+            );
+        }
+        details = details.child(meta);
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .px_3()
+            .py_2()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .child(details)
+            .child(
+                Button::new(SharedString::from(format!("endpoint-edit-{}", endpoint.id)))
+                    .ghost()
+                    .small()
+                    .icon(IconName::Pencil)
+                    .tooltip("ویرایش")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        Self::open_endpoint_dialog(Some(edit_target.clone()), window, cx)
+                    })),
+            )
+            .child(
+                Button::new(SharedString::from(format!("endpoint-remove-{}", endpoint.id)))
+                    .ghost()
+                    .small()
+                    .icon(IconName::Trash)
+                    .tooltip("حذف")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        Self::confirm_remove_endpoint(&remove_target, window, cx)
+                    })),
+            )
     }
 
     fn section(
@@ -350,7 +667,7 @@ impl SettingsPage {
 }
 
 impl Render for SettingsPage {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = AppSettings::get(cx).clone();
         let online = SidecarGlobal::get(cx).read(cx).is_online();
         let theme_ix = match settings.theme {
@@ -467,9 +784,60 @@ impl Render for SettingsPage {
                                     )
                                     .child(
                                         Field::new()
+                                            .label("فایل اجرایی opencode")
+                                            .child(div().ltr().w_full().child(Input::new(&self.opencode_bin))),
+                                    )
+                                    .child(
+                                        Field::new()
+                                            .label("مدل پیش‌فرض Claude")
+                                            .child(Select::new(&self.claude_model)),
+                                    )
+                                    .child(
+                                        Field::new()
+                                            .label("تلاش فکری پیش‌فرض Claude")
+                                            .child(Select::new(&self.claude_effort)),
+                                    )
+                                    .child(
+                                        Field::new()
                                             .label("مجوزهای Claude Code")
                                             .description("حالت --permission-mode برای هر پیام.")
                                             .child(Select::new(&self.permission)),
+                                    ),
+                            )
+                            // OpenAI-compatible endpoints
+                            .child(Self::section(
+                                "سرویس‌های سازگار با OpenAI",
+                                "هر API با /chat/completions، مثل OpenAI، OpenRouter، LM Studio یا vLLM.",
+                                cx,
+                            ))
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .gap_2()
+                                    .when(settings.endpoints.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("هنوز سرویسی اضافه نشده."),
+                                        )
+                                    })
+                                    .children(
+                                        settings
+                                            .endpoints
+                                            .iter()
+                                            .map(|endpoint| Self::endpoint_row(endpoint, cx)),
+                                    )
+                                    .child(
+                                        h_flex().child(
+                                            Button::new("endpoint-add")
+                                                .small()
+                                                .icon(IconName::Plus)
+                                                .label("افزودن سرویس")
+                                                .on_click(cx.listener(|_, _, window, cx| {
+                                                    Self::open_endpoint_dialog(None, window, cx)
+                                                })),
+                                        ),
                                     ),
                             )
                             // Conversation
@@ -483,8 +851,37 @@ impl Render for SettingsPage {
                                     .child(
                                         Field::new()
                                             .label("دستور سیستمی")
-                                            .description("برای Ollama پیام سیستمی و برای Claude Code با --append-system-prompt.")
+                                            .description("برای همهٔ بک‌اندها اعمال می‌شود: پیام سیستمی در Ollama و سرویس‌های OpenAI، و --append-system-prompt در Claude Code.")
                                             .child(Textarea::new(&self.system_prompt)),
+                                    )
+                                    .child(
+                                        Field::new()
+                                            .label("دستور عامل")
+                                            .description("برای Claude Code و opencode، بعد از دستور سیستمی اضافه می‌شود: پاسخ‌ها کوتاه و گفتنی، کار با خود عامل، زیرعامل فقط برای کارهای بزرگ.")
+                                            .child(
+                                                v_flex()
+                                                    .w_full()
+                                                    .gap_2()
+                                                    .child(Textarea::new(&self.agent_prompt))
+                                                    .child(
+                                                        h_flex().child(
+                                                            Button::new("agent-prompt-reset")
+                                                                .small()
+                                                                .outline()
+                                                                .label("بازگردانی پیش‌فرض")
+                                                                .on_click(cx.listener(
+                                                                    |this, _, window, cx| {
+                                                                        this.agent_prompt.update(cx, |state, cx| {
+                                                                            state.set_value(Settings::default().agent_prompt, window, cx)
+                                                                        });
+                                                                        AppSettings::update(cx, |s| {
+                                                                            s.agent_prompt = Settings::default().agent_prompt
+                                                                        });
+                                                                    },
+                                                                )),
+                                                        ),
+                                                    ),
+                                            ),
                                     )
                                     .child(
                                         Field::new()

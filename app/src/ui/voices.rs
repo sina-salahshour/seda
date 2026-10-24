@@ -43,7 +43,8 @@ use gpui_kit::{
 
 use crate::rtl;
 use crate::sidecar::{
-    ENGINES, Profile, ProfilePatch, Run, Sample, Sidecar, SidecarClient, SidecarGlobal,
+    EngineInfo, Profile, ProfilePatch, Run, Sample, Sidecar, SidecarClient, SidecarGlobal,
+    engine_defaults, engine_list,
 };
 use crate::ui::common::{empty_state, fa_digits, format_duration, sidecar_offline};
 
@@ -53,15 +54,15 @@ use try_it::{RunChoice, Slot};
 /// One engine in the engine pickers.
 #[derive(Clone)]
 struct EngineItem {
-    id: &'static str,
-    label: &'static str,
+    id: String,
+    label: SharedString,
 }
 
 impl SelectItem for EngineItem {
-    type Value = &'static str;
+    type Value = String;
 
     fn title(&self) -> SharedString {
-        self.label.into()
+        self.label.clone()
     }
 
     fn value(&self) -> &Self::Value {
@@ -69,28 +70,24 @@ impl SelectItem for EngineItem {
     }
 }
 
-fn engine_items() -> Vec<EngineItem> {
-    ENGINES
+/// Picker entries: the engine name plus non-commercial / not-ready markers.
+fn engine_items(engines: &[EngineInfo]) -> Vec<EngineItem> {
+    engines
         .iter()
-        .map(|(id, label)| EngineItem { id, label })
+        .map(|engine| {
+            let mut label = engine.name.clone();
+            if !engine.is_commercial() {
+                label.push_str(" · غیرتجاری");
+            }
+            if !engine.is_ready() {
+                label.push_str(" · مدل دانلود نشده");
+            }
+            EngineItem {
+                id: engine.id.clone(),
+                label: label.into(),
+            }
+        })
         .collect()
-}
-
-/// The `ENGINES` id equal to `engine`, if it is a known engine.
-fn known_engine(engine: &str) -> Option<&'static str> {
-    ENGINES
-        .iter()
-        .find(|(id, _)| *id == engine)
-        .map(|(id, _)| *id)
-}
-
-/// Short engine name for metadata lines.
-fn engine_short(engine: &str) -> &str {
-    match engine {
-        "omnivoice" => "OmniVoice",
-        "pocket_v2" => "Pocket TTS",
-        other => other,
-    }
 }
 
 /// The app-wide audio player, if an output device was found.
@@ -170,6 +167,8 @@ pub struct VoicesPage {
     samples: Vec<Sample>,
     samples_loading: bool,
     runs: Vec<Run>,
+    /// Engines from `/health` (or the built-in list while offline).
+    engines: Vec<EngineInfo>,
     engine_select: Entity<SelectState<Vec<EngineItem>>>,
 
     // Samples and recording.
@@ -211,8 +210,15 @@ impl VoicesPage {
         let sidecar = SidecarGlobal::get(cx);
         let online = sidecar.read(cx).is_online();
 
-        let engine_select =
-            cx.new(|cx| SelectState::new(engine_items(), Some(IndexPath::default()), window, cx));
+        let engines = engine_list(sidecar.read(cx).health());
+        let engine_select = cx.new(|cx| {
+            SelectState::new(
+                engine_items(&engines),
+                Some(IndexPath::default()),
+                window,
+                cx,
+            )
+        });
         let speech = cx.new(crate::audio::capture_speech_state);
         let steps = cx.new(|cx| InputState::new(window, cx).placeholder("پیش‌فرض"));
         let try_text = cx.new(|cx| {
@@ -231,6 +237,14 @@ impl VoicesPage {
                     this.reload_profiles(window, cx);
                 }
                 this.online = online;
+                let engines = engine_list(sidecar.read(cx).health());
+                if engines != this.engines {
+                    this.engines = engines;
+                    let items = engine_items(&this.engines);
+                    this.engine_select
+                        .update(cx, |select, cx| select.set_items(items, window, cx));
+                    this.sync_profile_controls(window, cx);
+                }
                 cx.notify();
             }),
             cx.subscribe_in(
@@ -242,11 +256,11 @@ impl VoicesPage {
                     };
                     let unchanged = this
                         .selected_profile()
-                        .is_none_or(|profile| profile.engine == *engine);
+                        .is_none_or(|profile| &profile.engine == engine);
                     if !unchanged {
                         this.patch_profile(
                             ProfilePatch {
-                                engine: Some(engine.to_string()),
+                                engine: Some(engine.clone()),
                                 ..Default::default()
                             },
                             window,
@@ -274,6 +288,7 @@ impl VoicesPage {
             samples: Vec::new(),
             samples_loading: false,
             runs: Vec::new(),
+            engines,
             engine_select,
             prompts: Vec::new(),
             prompt_ix: 0,
@@ -325,6 +340,33 @@ impl VoicesPage {
             })
             .ok();
         })
+    }
+
+    fn engine(&self, id: &str) -> Option<&EngineInfo> {
+        self.engines.iter().find(|engine| engine.id == id)
+    }
+
+    /// Short engine name for metadata lines.
+    fn engine_short(&self, id: &str) -> String {
+        match self.engine(id) {
+            Some(engine) => engine.short_name().to_string(),
+            None => engine_defaults(id)
+                .map(|d| d.short.to_string())
+                .unwrap_or_else(|| id.to_string()),
+        }
+    }
+
+    /// Whether the engine fine-tunes (LoRA); otherwise "training" picks the
+    /// best reference clip. Unknown engines count as trainable.
+    fn engine_trainable(&self, id: &str) -> bool {
+        match self.engine(id) {
+            Some(engine) => engine.is_trainable(),
+            None => engine_defaults(id).is_none_or(|d| d.trainable),
+        }
+    }
+
+    fn engine_ready(&self, id: &str) -> bool {
+        self.engine(id).is_none_or(|engine| engine.is_ready())
     }
 
     fn selected_profile(&self) -> Option<&Profile> {
@@ -471,7 +513,8 @@ impl VoicesPage {
     fn sync_profile_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(engine) = self
             .selected_profile()
-            .and_then(|p| known_engine(&p.engine))
+            .map(|p| p.engine.clone())
+            .filter(|engine| self.engine(engine).is_some())
         {
             self.engine_select.update(cx, |select, cx| {
                 if select.selected_value() != Some(&engine) {
@@ -505,14 +548,14 @@ impl VoicesPage {
     fn create_profile(
         &mut self,
         name: String,
-        engine: &'static str,
+        engine: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.spawn_job(
             window,
             cx,
-            move |client| client.create_profile(&name, Some(engine)),
+            move |client| client.create_profile(&name, Some(&engine)),
             |this, result, window, cx| match result {
                 Ok(profile) => {
                     let id = profile.id.clone();
@@ -557,8 +600,8 @@ impl VoicesPage {
 
     fn open_new_profile_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("مثلاً صدای من"));
-        let engine =
-            cx.new(|cx| SelectState::new(engine_items(), Some(IndexPath::default()), window, cx));
+        let items = engine_items(&self.engines);
+        let engine = cx.new(|cx| SelectState::new(items, Some(IndexPath::default()), window, cx));
         let view = cx.entity().downgrade();
         let initial_focus = Cell::new(true);
         window.open_dialog(cx, move |dialog, window, cx| {
@@ -587,8 +630,8 @@ impl VoicesPage {
                     let engine = engine_ok
                         .read(cx)
                         .selected_value()
-                        .copied()
-                        .unwrap_or("omnivoice");
+                        .cloned()
+                        .unwrap_or_else(|| "omnivoice".to_string());
                     view.update(cx, |this, cx| this.create_profile(name, engine, window, cx))
                         .ok();
                     true
@@ -711,7 +754,7 @@ impl VoicesPage {
                                 fa_digits(&profile.sample_count.to_string())
                             )),
                             meta_text(format_length(profile.total_seconds)),
-                            meta_text(engine_short(&profile.engine).to_string()),
+                            meta_text(self.engine_short(&profile.engine)),
                         ],
                         cx,
                     );
@@ -916,15 +959,56 @@ impl VoicesPage {
                     }),
             )
             .child(meta)
+            .child(self.render_engine_row(profile))
+    }
+
+    /// Engine picker, with a non-commercial note and, when the engine's model
+    /// is not downloaded, a link to the Models page.
+    fn render_engine_row(&self, profile: &Profile) -> impl IntoElement + use<> {
+        let engine = self.engine(&profile.engine).cloned();
+        let not_ready = !self.engine_ready(&profile.engine);
+        let non_commercial = engine.as_ref().is_some_and(|e| !e.is_commercial());
+        let license: SharedString = format!(
+            "مجوز {}: فقط استفادهٔ غیرتجاری.",
+            engine
+                .as_ref()
+                .and_then(|e| e.license().map(str::to_string))
+                .unwrap_or_default()
+        )
+        .into();
+        h_flex()
+            .flex_wrap()
+            .gap_3()
+            .text_sm()
+            .child("موتور صدا")
             .child(
-                h_flex().gap_3().text_sm().child("موتور صدا").child(
-                    div().w(px(240.)).flex_shrink_0().child(
-                        Select::new(&self.engine_select)
-                            .small()
-                            .accessibility_label("موتور صدا"),
-                    ),
+                div().w(px(280.)).flex_shrink_0().child(
+                    Select::new(&self.engine_select)
+                        .small()
+                        .accessibility_label("موتور صدا"),
                 ),
             )
+            .when(non_commercial, |this| {
+                this.child(
+                    div()
+                        .id("engine-non-commercial")
+                        .tooltip(move |window, cx| Tooltip::new(license.clone()).build(window, cx))
+                        .child(Tag::warning().xsmall().child("غیرتجاری")),
+                )
+            })
+            .when(not_ready, |this| {
+                this.child(Tag::danger().outline().xsmall().child("مدل دانلود نشده"))
+                    .child(
+                        Button::new("open-models")
+                            .xsmall()
+                            .outline()
+                            .icon(IconName::Boxes)
+                            .label("رفتن به مدل‌ها")
+                            .on_click(|_, window, cx| {
+                                crate::app::show_page(crate::app::Page::Models, window, cx)
+                            }),
+                    )
+            })
     }
 
     fn render_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

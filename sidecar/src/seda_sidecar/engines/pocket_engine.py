@@ -69,11 +69,42 @@ def _set_threads() -> None:
         pass
 
 
-def load_tts_model():
+def _model_yaml(path: str) -> str:
+    """pocket-tts config for a resolved model location (repo id or local dir).
+
+    The repo's model.yaml points its weights / tokenizer at hf://<repo>/...; for a
+    local dir a copy with those references rewritten to the dir is written to
+    $SEDA_DATA/cache/ so nothing is fetched from the hub."""
+    p = Path(path)
+    if not p.is_dir():
+        return f"hf://{path}/model.yaml"
+    import hashlib
+
+    from .. import catalog
+
+    text = (p / "model.yaml").read_text(encoding="utf-8")
+    repos = {m.repo for m in catalog.CATALOG.values() if m.engine == "pocket_v2"} | {config.POCKET_MODEL}
+    for repo in repos:
+        text = text.replace(f"hf://{repo}/", f"{p.resolve()}/")
+    out = config.DATA_DIR / "cache" / f"pocket-{hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:12]}.yaml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not out.is_file() or out.read_text(encoding="utf-8") != text:
+        out.write_text(text, encoding="utf-8")
+    return str(out)
+
+
+def _paths() -> dict[str, str]:
+    """{"tts": pocket model dir|repo, "homo_ge2pe": G2P dir|repo} (see models.engine_paths)."""
+    from .. import models
+
+    return models.engine_paths("pocket_v2")
+
+
+def load_tts_model(path: str | None = None):
     from pocket_tts import TTSModel
 
     return TTSModel.load_model(
-        config=f"hf://{config.POCKET_MODEL}/model.yaml",
+        config=_model_yaml(path or _paths()["tts"]),
         temp=TEMPERATURE,
         eos_threshold=EOS_THRESHOLD,
     )
@@ -316,17 +347,25 @@ class PocketV2Engine(Engine):
             import torch
             from transformers import AutoTokenizer, T5ForConditionalGeneration
 
+            from .. import models
+
             _set_threads()
-            model = load_tts_model()
-            tok = AutoTokenizer.from_pretrained(config.G2P_MODEL)
-            g2p = T5ForConditionalGeneration.from_pretrained(config.G2P_MODEL, dtype=torch.float32).eval()
+            ids = models.engine_model_ids(self.id)
+            paths = {role: models.resolve(mid) for role, mid in ids.items()}
+            log.info("loading pocket_v2 %s, G2P %s", paths["tts"], paths["homo_ge2pe"])
+            model = load_tts_model(paths["tts"])
+            tok = AutoTokenizer.from_pretrained(paths["homo_ge2pe"])
+            g2p = T5ForConditionalGeneration.from_pretrained(paths["homo_ge2pe"], dtype=torch.float32).eval()
             self._sp = model.flow_lm.conditioner.tokenizer.sp
             self._g2p_tok, self._g2p = tok, g2p
             self._model = model
+            self._tts_path = paths["tts"]
+            self.loaded_models = {ids[r]: paths[r] for r in ids}
 
     def unload(self) -> None:
         with self._lock:
             self._model = self._sp = self._g2p = self._g2p_tok = None
+            self.loaded_models = {}
             self._states.clear()
             import gc
 
@@ -499,7 +538,8 @@ class PocketV2Engine(Engine):
     def _default_prompt(self) -> np.ndarray:
         from huggingface_hub import hf_hub_download
 
-        p = hf_hub_download(config.POCKET_MODEL, "samples/prompt_hello.wav")
+        local = Path(getattr(self, "_tts_path", "") or "nonexistent") / "samples" / "prompt_hello.wav"
+        p = local if local.is_file() else hf_hub_download(_paths()["tts"], "samples/prompt_hello.wav")
         a = _read_wav(Path(p))
         st, en = _best_window(a)
         return a[st:en]
@@ -560,3 +600,20 @@ class PocketV2Engine(Engine):
         # short lead-in / tail so players and ASR do not clip the first/last phoneme
         wav = np.concatenate([np.zeros(int(0.05 * SR), np.float32), wav, np.zeros(int(0.1 * SR), np.float32)])
         return np.clip(wav, -1.0, 1.0)
+
+    # ------------------------------------------------------------ training
+    def artifact_ok(self, run_dir: Path) -> bool:
+        return (Path(run_dir) / "pocket" / "ref.wav").is_file()
+
+    def train(self, job: dict, run_dir: Path, emit) -> None:
+        """"Training" for pocket_v2 = choosing the best <= 5 s reference clip (CPU)."""
+        from .. import store
+
+        emit(stage="pocket", progress=0.1, message="choosing pocket reference")
+        model = None
+        tts_path = (job.get("model_paths") or {}).get("tts")
+        if tts_path:
+            _set_threads()
+            model = load_tts_model(tts_path)
+        info = prepare_pocket_reference(store.voice_profile(job["profile_id"]), Path(run_dir) / "pocket", model)
+        print(f"pocket reference: {info}", flush=True)

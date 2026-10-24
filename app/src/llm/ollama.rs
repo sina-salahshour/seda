@@ -1,4 +1,9 @@
 //! Ollama HTTP API: model list and streaming chat.
+//!
+//! Thinking: the request's `think` field is `false` by default, `true`, or a
+//! level (`low|medium|high`); see [`think_value`]. Replies carry reasoning in
+//! `message.thinking` (-> [`StreamEvent::Thinking`]); models that inline
+//! `<think>` tags in `message.content` are split by a [`ThinkSplitter`].
 
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
@@ -6,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow};
 use serde_json::{Value, json};
 
-use super::{CancelToken, Emitter, StreamEvent};
+use super::{CancelToken, Emitter, StreamEvent, ThinkSplitter};
 
 /// One message of the conversation sent to `/api/chat`.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,11 +55,14 @@ impl OllamaClient {
 
     /// Start `POST /api/chat` with `stream: true` on a worker thread.
     /// Emits `TextDelta`s, then `Done` or `Error`. Stops early (sending
-    /// `Done`) once `cancel` is set. Thinking output (`message.thinking`) is ignored.
+    /// `Done`) once `cancel` is set. `think`: `None`/`"off"`/`""` disables
+    /// thinking, `"on"` enables it, `"low"|"medium"|"high"` sets the level;
+    /// the reasoning is emitted as `Thinking` events.
     pub fn chat_stream(
         &self,
         model: &str,
         messages: Vec<OllamaMessage>,
+        think: Option<String>,
         cancel: CancelToken,
     ) -> async_channel::Receiver<StreamEvent> {
         let (emitter, rx) = Emitter::new(cancel);
@@ -62,12 +70,27 @@ impl OllamaClient {
         emitter.watch_cancel(|| {});
         let url = format!("{}/api/chat", self.base);
         let model = model.to_string();
-        std::thread::spawn(move || run_chat(&url, &model, &messages, &emitter));
+        std::thread::spawn(move || run_chat(&url, &model, &messages, think.as_deref(), &emitter));
         rx
     }
 }
 
-fn run_chat(url: &str, model: &str, messages: &[OllamaMessage], emitter: &Emitter) {
+/// The `think` request field for a UI level.
+fn think_value(think: Option<&str>) -> Value {
+    match think.map(str::trim) {
+        Some("on") => json!(true),
+        Some(level @ ("low" | "medium" | "high")) => json!(level),
+        _ => json!(false),
+    }
+}
+
+fn run_chat(
+    url: &str,
+    model: &str,
+    messages: &[OllamaMessage],
+    think: Option<&str>,
+    emitter: &Emitter,
+) {
     // Connect timeout only: a large model can take minutes to load and answer.
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(3))
@@ -80,8 +103,8 @@ fn run_chat(url: &str, model: &str, messages: &[OllamaMessage], emitter: &Emitte
         "model": model,
         "messages": messages,
         "stream": true,
-        // Skip the reasoning phase of thinking models (qwen3...) for fast replies.
-        "think": false,
+        // Off by default: skips the reasoning phase of thinking models (qwen3...).
+        "think": think_value(think),
     });
 
     let mut result = agent.post(url).send_json(body.clone());
@@ -105,6 +128,7 @@ fn run_chat(url: &str, model: &str, messages: &[OllamaMessage], emitter: &Emitte
     };
 
     let reader = BufReader::new(response.into_reader());
+    let mut parser = ChatParser::default();
     for line in reader.lines() {
         if emitter.should_stop() {
             // Dropping the reader closes the connection, which stops generation.
@@ -118,7 +142,7 @@ fn run_chat(url: &str, model: &str, messages: &[OllamaMessage], emitter: &Emitte
                 return;
             }
         };
-        for event in parse_chat_line(&line) {
+        for event in parser.parse_line(&line) {
             if !emitter.send(event) {
                 return;
             }
@@ -145,33 +169,45 @@ fn parse_tags(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Events from one NDJSON line of a streaming `/api/chat` response.
-fn parse_chat_line(line: &str) -> Vec<StreamEvent> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Vec::new();
+/// Stateful parser of the NDJSON lines of a streaming `/api/chat` response.
+#[derive(Default)]
+struct ChatParser {
+    splitter: ThinkSplitter,
+}
+
+impl ChatParser {
+    /// Events from one NDJSON line.
+    fn parse_line(&mut self, line: &str) -> Vec<StreamEvent> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Vec::new();
+        }
+        let value: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(err) => return vec![StreamEvent::Error(format!("Ollama: invalid JSON: {err}"))],
+        };
+        if let Some(error) = value.get("error") {
+            let msg = error
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string());
+            return vec![StreamEvent::Error(format!("Ollama: {msg}"))];
+        }
+        let mut events = Vec::new();
+        if let Some(text) = value.pointer("/message/thinking").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            events.push(StreamEvent::Thinking(text.to_string()));
+        }
+        if let Some(text) = value.pointer("/message/content").and_then(Value::as_str) {
+            events.extend(self.splitter.feed(text));
+        }
+        if value.get("done").and_then(Value::as_bool) == Some(true) {
+            events.extend(self.splitter.finish());
+            events.push(StreamEvent::Done);
+        }
+        events
     }
-    let value: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(err) => return vec![StreamEvent::Error(format!("Ollama: invalid JSON: {err}"))],
-    };
-    if let Some(error) = value.get("error") {
-        let msg = error
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| error.to_string());
-        return vec![StreamEvent::Error(format!("Ollama: {msg}"))];
-    }
-    let mut events = Vec::new();
-    if let Some(text) = value.pointer("/message/content").and_then(Value::as_str)
-        && !text.is_empty()
-    {
-        events.push(StreamEvent::TextDelta(text.to_string()));
-    }
-    if value.get("done").and_then(Value::as_bool) == Some(true) {
-        events.push(StreamEvent::Done);
-    }
-    events
 }
 
 /// A readable message for a failed request, including Ollama's `{"error"}` body.
@@ -195,6 +231,10 @@ fn http_error_message(err: ureq::Error) -> String {
 mod tests {
     use super::*;
 
+    fn parse_chat_line(line: &str) -> Vec<StreamEvent> {
+        ChatParser::default().parse_line(line)
+    }
+
     #[test]
     fn tags() {
         let body = json!({"models":[{"name":"qwen3.8:latest","model":"qwen3.8:latest"},{"model":"llama3:8b"}]});
@@ -210,7 +250,10 @@ mod tests {
             vec![StreamEvent::TextDelta("سلام".into())]
         );
         let thinking = r#"{"model":"q","message":{"role":"assistant","content":"","thinking":"hmm"},"done":false}"#;
-        assert!(parse_chat_line(thinking).is_empty());
+        assert_eq!(
+            parse_chat_line(thinking),
+            vec![StreamEvent::Thinking("hmm".into())]
+        );
         let done = r#"{"model":"q","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}"#;
         assert_eq!(parse_chat_line(done), vec![StreamEvent::Done]);
         let err = r#"{"error":"model 'x' not found"}"#;
@@ -219,6 +262,39 @@ mod tests {
             vec![StreamEvent::Error("Ollama: model 'x' not found".into())]
         );
         assert!(parse_chat_line("  ").is_empty());
+    }
+
+    #[test]
+    fn inline_think_split_across_lines() {
+        let mut p = ChatParser::default();
+        let l1 = r#"{"message":{"role":"assistant","content":"<think>pl"},"done":false}"#;
+        let l2 = r#"{"message":{"role":"assistant","content":"an</think>Hi <"},"done":false}"#;
+        let l3 = r#"{"message":{"role":"assistant","content":""},"done":true}"#;
+        let mut events = p.parse_line(l1);
+        events.extend(p.parse_line(l2));
+        events.extend(p.parse_line(l3));
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Thinking("pl".into()),
+                StreamEvent::Thinking("an".into()),
+                StreamEvent::TextDelta("Hi ".into()),
+                StreamEvent::TextDelta("<".into()),
+                StreamEvent::Done
+            ]
+        );
+    }
+
+    #[test]
+    fn think_values() {
+        assert_eq!(think_value(None), json!(false));
+        assert_eq!(think_value(Some("")), json!(false));
+        assert_eq!(think_value(Some("off")), json!(false));
+        assert_eq!(think_value(Some("on")), json!(true));
+        assert_eq!(think_value(Some("low")), json!("low"));
+        assert_eq!(think_value(Some("medium")), json!("medium"));
+        assert_eq!(think_value(Some("high")), json!("high"));
+        assert_eq!(think_value(Some("bogus")), json!(false));
     }
 
     #[test]
@@ -253,6 +329,7 @@ mod tests {
                 role: "user".into(),
                 content: "Say hello in one short sentence.".into(),
             }],
+            None,
             CancelToken::new(),
         );
         let mut first = None;
@@ -290,6 +367,7 @@ mod tests {
                 role: "user".into(),
                 content: "Count from 1 to 200.".into(),
             }],
+            None,
             cancel.clone(),
         );
         let mut n = 0;

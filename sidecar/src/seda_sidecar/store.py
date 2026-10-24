@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from . import config
+from .engines import DEFAULT_ENGINE, ENGINE_IDS
 
 _lock = threading.RLock()
 
-ENGINES = ("omnivoice", "pocket_v2")
+ENGINES = ENGINE_IDS  # derived from engines.REGISTRY
 
 
 class NotFound(Exception):
@@ -96,7 +97,7 @@ def list_profiles() -> list[dict]:
         return out
 
 
-def create_profile(name: str, engine: str = "omnivoice") -> dict:
+def create_profile(name: str, engine: str = DEFAULT_ENGINE) -> dict:
     with _lock:
         pid = new_id()
         prof = {

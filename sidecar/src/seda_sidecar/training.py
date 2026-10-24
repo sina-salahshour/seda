@@ -1,11 +1,15 @@
-"""Training job manager: OmniVoice LoRA fine-tuning runs in a subprocess.
+"""Training job manager: per-engine "training" runs in a subprocess.
+
+What a run produces depends on the profile's engine (``engines.REGISTRY`` /
+``Engine.train``): an OmniVoice LoRA adapter, a pocket_v2 reference clip, or
+XTTS voice latents. Success = the engine's ``artifact_ok(run_dir)``.
 
 One job runs at a time, at most one more waits in the queue. The child is
 ``sys.executable -m seda_sidecar.train_worker <run_dir>`` in its own process
 group; its stdout goes to run_dir/train.log and its ``@@PROGRESS {json}`` lines
 are mirrored into run.json.
 
-Default step count (``default_steps``) scales with the amount of audio:
+OmniVoice's default step count (``default_steps``) scales with the amount of audio:
 
     steps = clamp(round(150 + 12 * minutes), 200, 1000)
 
@@ -29,7 +33,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from . import config, manager, store
+from . import config, engines, manager, models, store
 
 log = logging.getLogger("seda.training")
 
@@ -37,22 +41,8 @@ PROGRESS_PREFIX = "@@PROGRESS "
 MAX_QUEUED = 1
 MIN_STEPS, MAX_STEPS = 1, 20000
 
-DEFAULT_PARAMS = {
-    "lora_r": 16,
-    "lora_alpha": 32,
-    "lora_dropout": 0.05,
-    "learning_rate": 1e-4,
-    "warmup_ratio": 0.05,
-    "batch_tokens": 3072,
-    "grad_accum": 2,
-    "max_batch_size": 16,
-    "max_sample_tokens": 1500,
-    "min_sample_tokens": 30,
-    "gradient_checkpointing": True,
-    "mixed_precision": "bf16",
-    "attn_implementation": "sdpa",
-    "seed": 42,
-}
+# OmniVoice LoRA defaults (kept for compatibility; per-engine: engines.default_params).
+DEFAULT_PARAMS = engines.default_params("omnivoice")
 
 
 class Busy(Exception):
@@ -67,9 +57,20 @@ _wake = threading.Event()
 _stop = False
 
 
-def default_steps(total_seconds: float) -> int:
-    minutes = total_seconds / 60.0
-    return int(min(1000, max(200, round(150 + 12 * minutes))))
+def default_steps(total_seconds: float, engine: str = "omnivoice") -> int:
+    return engines.default_steps(engine, total_seconds)
+
+
+def run_models(eid: str) -> tuple[dict[str, str], dict[str, str]]:
+    """({role: "<model id or repo>@<revision or path>"}, {role: path or repo}) for a run."""
+    ids = models.engine_model_ids(eid)
+    paths = {role: models.resolve(mid) for role, mid in ids.items()}
+    if eid == "omnivoice":
+        tts = Path(paths["tts"])
+        if tts.is_dir() and not (tts / "audio_tokenizer").is_dir():
+            ids["audio_tokenizer"] = "higgs_tokenizer"
+            paths["audio_tokenizer"] = models.resolve("higgs_tokenizer")
+    return {role: models.model_ref(mid) for role, mid in ids.items()}, paths
 
 
 def _usable_samples(pid: str) -> list[dict]:
@@ -94,19 +95,28 @@ def _update(pid: str, rid: str, **fields) -> dict | None:
 # ---------------------------------------------------------------- public API
 def start_run(pid: str, steps: int | None = None, from_run: str | None = None) -> dict:
     prof = store.get_profile(pid)  # raises NotFound
+    eid = prof["engine"]
+    if eid not in engines.REGISTRY:
+        raise ValueError(f"unknown engine {eid!r}")
+    sp = engines.spec(eid)
+    if not sp.trainable:
+        # "prepare voice" engines: steps / from_run do not apply and are ignored
+        steps, from_run = None, None
     samples = _usable_samples(pid)
     if not samples:
         raise ValueError("profile has no samples with transcripts to train on")
-    init_adapter = None
+    eng = manager.engine(eid)
+    from_run_dir = None
     if from_run:
         prev = store.get_run(pid, from_run)  # raises NotFound
-        adapter = store.run_dir(pid, from_run) / "adapter"
-        if prev.get("status") != "done" or not (adapter / "adapter_config.json").is_file():
-            raise ValueError(f"run {from_run} has no finished adapter to continue from")
-        init_adapter = str(adapter)
+        prev_dir = store.run_dir(pid, from_run)
+        if prev.get("status") != "done" or not eng.artifact_ok(prev_dir):
+            raise ValueError(f"run {from_run} has no finished {eid} artefact to continue from")
+        from_run_dir = str(prev_dir)
+    run_model_refs, model_paths = run_models(eid)
     total = sum(s["duration"] for s in samples)
     if steps is None:
-        steps = default_steps(total)
+        steps = default_steps(total, eid)
     steps = int(steps)
     if not MIN_STEPS <= steps <= MAX_STEPS:
         raise ValueError(f"steps must be between {MIN_STEPS} and {MAX_STEPS}")
@@ -115,11 +125,11 @@ def start_run(pid: str, steps: int | None = None, from_run: str | None = None) -
         if _current is not None and len(_queue) >= MAX_QUEUED:
             raise Busy("a training run is already in progress and another is queued")
         rid = store.new_id()
-        params = dict(DEFAULT_PARAMS, steps=steps, from_run=from_run, total_seconds=round(total, 2))
+        params = dict(engines.default_params(eid), steps=steps, from_run=from_run, total_seconds=round(total, 2))
         run = {
             "id": rid,
             "profile_id": pid,
-            "engine": prof["engine"],
+            "engine": eid,
             "status": "queued",
             "progress": 0.0,
             "step": 0,
@@ -130,11 +140,12 @@ def start_run(pid: str, steps: int | None = None, from_run: str | None = None) -
             "finished_at": None,
             "sample_count": len(samples),
             "params": params,
+            "models": run_model_refs,
         }
         rdir = store.run_dir(pid, rid)
         rdir.mkdir(parents=True, exist_ok=True)
-        job = {"profile_id": pid, "engine": prof["engine"], "samples": samples,
-               "params": params, "init_adapter": init_adapter}
+        job = {"profile_id": pid, "engine": eid, "samples": samples, "params": params,
+               "from_run_dir": from_run_dir, "model_paths": model_paths}
         store.write_json(rdir / "job.json", job)
         store.save_run(run)
         _queue.append((pid, rid))
@@ -304,10 +315,15 @@ def _run_job(pid: str, rid: str) -> None:
     if run.get("status") != "queued":
         return
     rdir = store.run_dir(pid, rid)
-    _update(pid, rid, status="running", message="freeing GPU memory")
-    manager.TRAINING.set()  # blocks new GPU inference before we unload
-    manager.unload_all()
-    _ollama_unload()
+    eid = run.get("engine") or "omnivoice"
+    sp = engines.spec(eid) if eid in engines.REGISTRY else engines.spec("omnivoice")
+    if sp.train_gpu:
+        _update(pid, rid, status="running", message="freeing GPU memory")
+        manager.TRAINING.set()  # blocks new GPU inference before we unload
+        manager.unload_all()
+        _ollama_unload()
+    else:
+        _update(pid, rid, status="running", message="starting")
 
     with _lock:
         if _current is None or _current["cancel"]:
@@ -363,10 +379,10 @@ def _run_job(pid: str, rid: str) -> None:
     rc = proc.returncode
     with _lock:
         cancelled = bool(_current and _current["cancel"])
-    adapter_ok = (rdir / "adapter" / "adapter_config.json").is_file()
+    artifact_ok = manager.engine(sp.id).artifact_ok(rdir)
     if cancelled:
         _update(pid, rid, status="cancelled", message="cancelled", finished_at=store.now())
-    elif rc == 0 and adapter_ok:
+    elif rc == 0 and artifact_ok:
         _update(pid, rid, status="done", progress=1.0, message="done", finished_at=store.now())
         try:
             store.update_profile(pid, active_run=rid)

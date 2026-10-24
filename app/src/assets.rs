@@ -54,6 +54,9 @@ gpui_kit::assets::icon_assets!(
         Wrench,
         X,
         Zap,
+        Boxes,
+        FolderPlus,
+        KeyRound,
     ]
 );
 

@@ -36,43 +36,95 @@ def busy() -> str | None:
     return _busy
 
 
-def _engine_classes() -> dict:
-    from .engines.omnivoice_engine import OmniVoiceEngine
-    from .engines.pocket_engine import PocketV2Engine
-
-    return {"omnivoice": OmniVoiceEngine, "pocket_v2": PocketV2Engine}
-
-
 def engine(eid: str):
     """Return the (possibly unloaded) engine singleton."""
     if eid not in _engines:
-        classes = _engine_classes()
-        if eid not in classes:
+        from .engines import REGISTRY
+
+        if eid not in REGISTRY:
             raise KeyError(f"unknown engine {eid!r}")
-        _engines[eid] = classes[eid]()
+        _engines[eid] = REGISTRY[eid].load_class()()
     return _engines[eid]
 
 
 def engines_info() -> list[dict]:
+    from . import models
+    from .engines import REGISTRY
+
     out = []
-    for eid in ("omnivoice", "pocket_v2"):
+    for eid, sp in REGISTRY.items():
         e = _engines.get(eid)
-        name = e.name if e else {"omnivoice": "OmniVoice", "pocket_v2": "Pocket TTS Farsi v2"}[eid]
-        out.append({"id": eid, "name": name, "loaded": bool(e and e.loaded)})
+        try:
+            ready = models.engine_ready(eid)
+        except Exception:  # noqa: BLE001
+            ready = False
+        out.append({
+            "id": eid,
+            "name": sp.name,
+            "loaded": bool(e and e.loaded),
+            "uses_gpu": sp.uses_gpu,
+            "trainable": sp.trainable,
+            "ready": ready,
+            "license": sp.license,
+            "commercial": sp.commercial,
+            "model": models.engine_model_id(eid),
+        })
     return out
 
 
 def stt_model():
     global _stt
     if _stt is None:
+        from . import models
         from .stt import WhisperSTT
 
-        _stt = WhisperSTT()
+        _stt = WhisperSTT(model_id=models.stt_path(), generate_kwargs=models.stt_generate_kwargs())
+        _stt.catalog_id = models.stt_model_id()
     return _stt
 
 
 def stt_loaded() -> bool:
     return bool(_stt and _stt.loaded)
+
+
+def reset_stt() -> None:
+    """Drop the STT model (e.g. after stt_model changed); the next use builds a new one."""
+    global _stt
+    with GPU_LOCK:
+        if _stt is not None and _stt.loaded:
+            _stt.unload()
+        _stt = None
+        _free_cuda()
+
+
+def unload_engine(eid: str) -> None:
+    with GPU_LOCK:
+        e = _engines.get(eid)
+        if e is not None and e.loaded:
+            log.info("unloading engine %s", eid)
+            e.unload()
+            _free_cuda()
+
+
+def models_in_use() -> set[str]:
+    """Model ids (catalog or "local:...") whose weights are loaded right now."""
+    out: set[str] = set()
+    for e in list(_engines.values()):
+        if e.loaded:
+            out.update((getattr(e, "loaded_models", None) or {}).keys())
+    if _stt is not None and _stt.loaded:
+        out.add(getattr(_stt, "catalog_id", "") or "")
+    out.discard("")
+    return out
+
+
+def unload_model(mid: str) -> None:
+    """Unload whatever uses model `mid` (before deleting it)."""
+    for eid, e in list(_engines.items()):
+        if e.loaded and mid in (getattr(e, "loaded_models", None) or {}):
+            unload_engine(eid)
+    if _stt is not None and getattr(_stt, "catalog_id", None) == mid:
+        reset_stt()
 
 
 def _free_cuda() -> None:

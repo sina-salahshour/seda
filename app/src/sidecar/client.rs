@@ -206,6 +206,41 @@ impl SidecarClient {
         self.delete(&format!("/profiles/{pid}/runs/{rid}"))
     }
 
+    // MARK: Models
+
+    pub fn models(&self) -> Result<Vec<ModelInfo>> {
+        self.get_json("/models")
+    }
+
+    pub fn download_model(&self, id: &str) -> Result<ModelInfo> {
+        self.send_json(
+            "POST",
+            &format!("/models/{}/download", encode_id(id)),
+            json!({}),
+        )
+    }
+
+    pub fn cancel_model_download(&self, id: &str) -> Result<ModelInfo> {
+        self.send_json(
+            "POST",
+            &format!("/models/{}/cancel", encode_id(id)),
+            json!({}),
+        )
+    }
+
+    /// Deletes the Hugging Face cache copy of a catalog model.
+    pub fn delete_model(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/models/{}", encode_id(id)))
+    }
+
+    pub fn models_config(&self) -> Result<ModelsConfig> {
+        self.get_json("/models/config")
+    }
+
+    pub fn update_models_config(&self, patch: &ModelsConfigPatch) -> Result<ModelsConfig> {
+        self.send_json("PATCH", "/models/config", serde_json::to_value(patch)?)
+    }
+
     /// `POST /tts` → WAV bytes (24 kHz mono 16-bit).
     pub fn tts(&self, request: &TtsRequest) -> Result<Vec<u8>> {
         let mut body = json!({
@@ -242,5 +277,37 @@ impl SidecarClient {
             .unwrap_or_default()
             .trim()
             .to_string())
+    }
+}
+
+/// Percent-encode a path segment: everything but RFC 3986 unreserved
+/// characters, so ids like `local:/abs/path` stay one segment.
+pub fn encode_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for byte in id.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_id;
+
+    #[test]
+    fn encodes_ids() {
+        assert_eq!(encode_id("whisper-large_v3.t~"), "whisper-large_v3.t~");
+        assert_eq!(encode_id("k2-fsa/OmniVoice"), "k2-fsa%2FOmniVoice");
+        assert_eq!(
+            encode_id("local:/home/me/my models/x"),
+            "local%3A%2Fhome%2Fme%2Fmy%20models%2Fx"
+        );
+        assert_eq!(encode_id("مدل"), "%D9%85%D8%AF%D9%84");
+        assert_eq!(encode_id("a?b#c%"), "a%3Fb%23c%25");
     }
 }

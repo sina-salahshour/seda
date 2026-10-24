@@ -517,6 +517,20 @@ impl VoicesPage {
                     ),
             )
             .when_some(progress_line, |this, line| this.child(line))
+            .when(!run.models.is_empty(), |this| {
+                this.child(meta_row(
+                    std::iter::once(meta_text("مدل‌ها:")).chain(run.models.iter().map(
+                        |(role, model)| {
+                            div()
+                                .ltr()
+                                .whitespace_nowrap()
+                                .child(format!("{role}: {model}"))
+                                .into_any_element()
+                        },
+                    )),
+                    cx,
+                ))
+            })
             .when(!run.message.trim().is_empty(), |this| {
                 this.child(
                     div()
@@ -537,17 +551,21 @@ impl VoicesPage {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let muted_foreground = cx.theme().muted_foreground;
-        let pocket = profile.engine == "pocket_v2";
+        // Engines without fine-tuning "train" by picking the best reference clip.
+        let picks_reference = !self.engine_trainable(&profile.engine);
+        let engine_ready = self.engine_ready(&profile.engine);
         let busy = self.sidecar_busy(cx);
         let running = self.any_run_active();
-        let blocked = busy.is_some() || running || self.train_pending;
+        let blocked = busy.is_some() || running || self.train_pending || !engine_ready;
         let no_samples = profile.sample_count == 0 && self.samples.is_empty();
-        let can_retrain = !pocket && profile.active_run.is_some();
+        let can_retrain = !picks_reference && profile.active_run.is_some();
 
         let reason: Option<String> = if running {
             Some("یک آموزش در جریان است.".into())
         } else if let Some(busy) = &busy {
             Some(format!("سایدکار مشغول است: {busy}"))
+        } else if !engine_ready {
+            Some("مدل این موتور هنوز دانلود نشده؛ از صفحهٔ «مدل‌ها» دانلودش کن.".into())
         } else if no_samples {
             Some("برای آموزش اول چند نمونه اضافه کن.".into())
         } else {
@@ -559,7 +577,7 @@ impl VoicesPage {
                 .w_full()
                 .gap_3()
                 .flex_wrap()
-                .when(!pocket, |this| {
+                .when(!picks_reference, |this| {
                     this.child(
                         h_flex().gap_2().text_sm().child("تعداد گام‌ها").child(
                             div()
@@ -572,7 +590,7 @@ impl VoicesPage {
                     let button = Button::new("train-fresh")
                         .small()
                         .icon(IconName::GraduationCap)
-                        .label(if pocket {
+                        .label(if picks_reference {
                             "انتخاب بهترین مرجع"
                         } else {
                             "آموزش از صفر"
@@ -648,9 +666,12 @@ impl VoicesPage {
         section(
             false,
             "آموزش",
-            Some(if pocket {
-                "برای Pocket TTS، «آموزش» بهترین تکهٔ کمتر از ۵ ثانیه را به‌عنوان مرجع انتخاب می‌کند."
-                    .into()
+            Some(if picks_reference {
+                format!(
+                    "برای {}، «آموزش» بهترین تکهٔ کوتاه نمونه‌ها را به‌عنوان مرجع انتخاب می‌کند.",
+                    self.engine_short(&profile.engine)
+                )
+                .into()
             } else {
                 "یک LoRA روی همهٔ نمونه‌های فعلی آموزش می‌دهد. وقتی تمام شود، مدل تازه فعال می‌شود."
                     .into()

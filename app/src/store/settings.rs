@@ -55,6 +55,24 @@ pub enum ThemePreference {
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "تو یک دستیار صوتی فارسی‌زبان هستی. به فارسی طبیعی و محاوره‌ای جواب بده، با جمله‌های کوتاه که خواندنشان با صدا راحت باشد. وقتی پاسخ با صدا خوانده می‌شود از جدول مارک‌داون و فهرست‌های طولانی استفاده نکن.";
 
+/// Appended after the system prompt for agents that use tools (Claude Code,
+/// opencode): they talk through voice, so they should work quietly and report briefly.
+pub const DEFAULT_AGENT_PROMPT: &str = "تو رابط صوتی و فکری کاربر هستی و پاسخ‌هایت با صدا برای او خوانده می‌شوند؛ پس کوتاه، روشن و محاوره‌ای جواب بده. کارها را خودت انجام بده. فقط وقتی سراغ زیرعامل (subagent) برو که کار بزرگ است، می‌شود آن را موازی جلو برد، خروجی‌اش ذهن و زمینهٔ تو را پر می‌کند، یا خود کاربر خواسته است. خروجی زیرعامل‌ها خوانده نمی‌شود؛ نتیجه‌شان را با چند جملهٔ قابل‌گفتن برای کاربر خلاصه کن. هرگز کد یا لاگ طولانی را در پاسخ نچسبان؛ به‌جایش بگو چه کردی و نتیجه چه شد.";
+
+/// An OpenAI-compatible API (`{base_url}/chat/completions`, `{base_url}/models`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Endpoint {
+    /// Stable id that sessions refer to.
+    pub id: String,
+    pub name: String,
+    /// e.g. `https://api.openai.com/v1`.
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub default_model: Option<String>,
+}
+
 /// `settings.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -68,6 +86,15 @@ pub struct Settings {
     pub system_prompt: String,
     pub claude_bin: String,
     pub claude_permission_mode: PermissionMode,
+    /// Defaults for new Claude Code sessions (`--model`, `--effort`).
+    pub default_claude_model: Option<String>,
+    pub default_claude_effort: Option<String>,
+    /// Appended after `system_prompt` for tool-using agents (Claude Code, opencode).
+    pub agent_prompt: String,
+    /// Path to the `opencode` binary.
+    pub opencode_bin: String,
+    /// OpenAI-compatible endpoints.
+    pub endpoints: Vec<Endpoint>,
     /// Right-to-left layout (default on).
     pub rtl: bool,
     pub theme: ThemePreference,
@@ -109,6 +136,14 @@ impl Default for Settings {
                 .to_string_lossy()
                 .into_owned(),
             claude_permission_mode: PermissionMode::Default,
+            default_claude_model: None,
+            default_claude_effort: None,
+            agent_prompt: DEFAULT_AGENT_PROMPT.into(),
+            opencode_bin: home
+                .join(".opencode/bin/opencode")
+                .to_string_lossy()
+                .into_owned(),
+            endpoints: Vec::new(),
             rtl: true,
             theme: ThemePreference::System,
             tts_speed: 1.0,
@@ -138,6 +173,26 @@ impl Settings {
 
     pub fn save(&self) -> Result<()> {
         super::write_atomic(&Self::path(), &serde_json::to_vec_pretty(self)?)
+    }
+
+    pub fn endpoint(&self, id: &str) -> Option<&Endpoint> {
+        self.endpoints.iter().find(|e| e.id == id)
+    }
+
+    /// The system prompt for a backend: the voice style, plus the agent
+    /// prompt for tool-using agents.
+    pub fn prompt_for(&self, uses_tools: bool) -> String {
+        let base = self.system_prompt.trim();
+        let agent = self.agent_prompt.trim();
+        if uses_tools && !agent.is_empty() {
+            if base.is_empty() {
+                agent.to_string()
+            } else {
+                format!("{base}\n\n{agent}")
+            }
+        } else {
+            base.to_string()
+        }
     }
 }
 

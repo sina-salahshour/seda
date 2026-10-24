@@ -105,22 +105,28 @@ class OmniVoiceEngine(Engine):
             import torch
             from omnivoice.models.omnivoice import OmniVoice
 
+            from .. import models
+
+            ids = models.engine_model_ids(self.id)
+            path = models.resolve(ids["tts"])
             dev = "cuda" if torch.cuda.is_available() else "cpu"
             dtype = torch.float16 if dev == "cuda" else torch.float32
-            log.info("loading OmniVoice %s on %s (%s)", config.OMNIVOICE_MODEL, dev, dtype)
+            log.info("loading OmniVoice %s on %s (%s)", path, dev, dtype)
             self._model = OmniVoice.from_pretrained(
-                config.OMNIVOICE_MODEL,
+                path,
                 device_map=dev,
                 dtype=dtype,
                 attn_implementation="sdpa",
             )
             self._model.eval()
             self._device = dev
+            self.loaded_models = {ids["tts"]: path}
 
     def unload(self) -> None:
         with self._lock:
             self._model = None
             self._peft = None
+            self.loaded_models = {}
             self._adapters.clear()
             self._prompts.clear()
             _clear_higgs_caches()
@@ -232,3 +238,15 @@ class OmniVoiceEngine(Engine):
 
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=config.SAMPLE_RATE)
             return np.clip(audio, -1.0, 1.0).astype(np.float32)
+
+    # ------------------------------------------------------------ training
+    def artifact_ok(self, run_dir: Path) -> bool:
+        return (Path(run_dir) / "adapter" / "adapter_config.json").is_file()
+
+    def train(self, job: dict, run_dir: Path, emit) -> None:
+        """LoRA fine-tuning (engines/omnivoice_train.py) -> run_dir/adapter."""
+        from .. import models
+        from . import omnivoice_train
+
+        path = (job.get("model_paths") or {}).get("tts") or models.resolve(models.engine_model_id(self.id))
+        omnivoice_train.run(job, Path(run_dir), emit, path)

@@ -7,8 +7,8 @@ mod settings;
 
 use std::path::PathBuf;
 
-pub use sessions::{Backend, ChatMessage, Role, Session};
-pub use settings::{AppSettings, PermissionMode, Settings, ThemePreference};
+pub use sessions::{Backend, ChatMessage, Role, Session, TaskInfo};
+pub use settings::{AppSettings, Endpoint, PermissionMode, Settings, ThemePreference};
 
 /// `$SEDA_DATA`, or `~/.local/share/seda`.
 pub fn data_dir() -> PathBuf {

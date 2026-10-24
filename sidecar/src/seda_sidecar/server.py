@@ -13,7 +13,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
-from . import audio, config, manager, prompts, store
+from . import audio, config, manager, models, prompts, store
+from .engines import DEFAULT_ENGINE
 
 log = logging.getLogger("seda.server")
 
@@ -46,6 +47,10 @@ def _is_training_busy(exc: Exception) -> bool:
 async def lifespan(app: FastAPI):
     config.PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     try:
+        models.startup()
+    except Exception:
+        log.exception("models.startup() failed")
+    try:
         from . import training
 
         training.recover()
@@ -61,6 +66,10 @@ async def lifespan(app: FastAPI):
             training.shutdown()
         except Exception:
             log.exception("training.shutdown() failed")
+        try:
+            models.shutdown()
+        except Exception:
+            log.exception("models.shutdown() failed")
 
 
 app = FastAPI(title="Seda sidecar", version="0.1.0", lifespan=lifespan)
@@ -81,6 +90,21 @@ async def _validation_handler(_: Request, exc: RequestValidationError):
 
 @app.exception_handler(store.NotFound)
 async def _notfound_handler(_: Request, exc: store.NotFound):
+    return _err(404, str(exc))
+
+
+@app.exception_handler(models.ModelError)
+async def _model_error_handler(_: Request, exc: models.ModelError):
+    return _err(400, str(exc))
+
+
+@app.exception_handler(models.ModelConflict)
+async def _model_conflict_handler(_: Request, exc: models.ModelConflict):
+    return _err(409, str(exc))
+
+
+@app.exception_handler(models.ModelNotFound)
+async def _model_notfound_handler(_: Request, exc: models.ModelNotFound):
     return _err(404, str(exc))
 
 
@@ -160,6 +184,7 @@ def health():
         "gpu": _gpu_info(),
         "engines": manager.engines_info(),
         "stt_loaded": manager.stt_loaded(),
+        "stt_model": models.stt_model_id(),
         "busy": manager.busy(),
     }
 
@@ -173,7 +198,7 @@ def unload():
 # ---------------------------------------------------------------- profiles
 class ProfileCreate(BaseModel):
     name: str
-    engine: str = "omnivoice"
+    engine: str = DEFAULT_ENGINE
 
 
 class ProfilePatch(BaseModel):
@@ -356,7 +381,12 @@ class TrainRequest(BaseModel):
 @app.post("/profiles/{pid}/train")
 def train(pid: str, body: TrainRequest | None = None):
     body = body or TrainRequest()
-    store.get_profile(pid)
+    prof = store.get_profile(pid)
+    from .engines import REGISTRY
+
+    sp = REGISTRY.get(prof["engine"])
+    if sp is not None and not sp.trainable:
+        body = TrainRequest()  # "prepare voice" engines ignore steps / from_run
     if body.steps is not None and body.steps <= 0:
         raise HTTPException(400, "steps must be positive")
     tr = _training()
@@ -400,6 +430,52 @@ def delete_run(pid: str, rid: str):
     store.get_profile(pid)
     store.get_run(pid, rid)
     _training().delete_run(pid, rid)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- models
+class ModelsConfigPatch(BaseModel):
+    stt_model: str | None = None
+    model_dirs: list[str] | None = None
+    engine_models: dict[str, str | None] | None = None
+    hf_token: str | None = None
+
+
+@app.get("/models")
+def list_models():
+    return models.list_models()
+
+
+@app.get("/models/config")
+def get_models_config():
+    return models.public_config()
+
+
+@app.patch("/models/config")
+def patch_models_config(body: ModelsConfigPatch):
+    patch = {k: getattr(body, k) for k in body.model_fields_set}
+    cfg, changed = models.update_config(patch)
+    if "stt" in changed:
+        manager.reset_stt()
+    for c in changed:
+        if c.startswith("engine:"):
+            manager.unload_engine(c.split(":", 1)[1])
+    return cfg
+
+
+@app.post("/models/{mid:path}/download")
+def download_model(mid: str):
+    return models.start_download(mid)
+
+
+@app.post("/models/{mid:path}/cancel")
+def cancel_model_download(mid: str):
+    return models.cancel_download(mid)
+
+
+@app.delete("/models/{mid:path}")
+def delete_model(mid: str):
+    models.delete_model(mid)
     return {"ok": True}
 
 

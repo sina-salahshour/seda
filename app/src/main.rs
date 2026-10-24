@@ -69,11 +69,13 @@ fn main() {
                 window_min_size: Some(MIN_WINDOW),
                 // SEDA_APP_ID lets test instances use their own Wayland app id.
                 app_id: Some(std::env::var("SEDA_APP_ID").unwrap_or_else(|_| "seda".into())),
+                // Our own title bar (app::SedaApp) draws the window controls.
                 titlebar: Some(TitlebarOptions {
                     title: Some("صدا — Seda".into()),
-                    ..Default::default()
+                    ..component::TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                window_decorations: Some(WindowDecorations::Client),
+                ..component::TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| app::SedaApp::new(window, cx))

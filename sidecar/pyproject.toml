@@ -1,7 +1,7 @@
 [project]
 name = "seda-sidecar"
 version = "0.1.0"
-description = "Seda ML sidecar: Persian TTS (OmniVoice, pocket-tts-farsi-v2), Whisper STT, LoRA training"
+description = "Seda ML sidecar: Persian TTS (OmniVoice, pocket-tts-farsi-v2, ParsVoice-XTTS), Whisper STT, LoRA training"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "torch==2.8.0",
@@ -23,6 +23,7 @@ dependencies = [
     "sentencepiece",
     "pyyaml",
     "sphn",
+    "coqui-tts>=0.27",
 ]
 
 [project.scripts]

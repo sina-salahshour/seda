@@ -1,5 +1,6 @@
 //! Claude Code CLI in print mode with stream-json output.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -7,7 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use super::{CancelToken, Emitter, StreamEvent, truncate};
+use super::{
+    CancelToken, Emitter, StreamEvent, expand_home, result_summary, tool_summary, truncate,
+};
 
 #[derive(Debug, Clone)]
 pub struct ClaudeRequest {
@@ -21,6 +24,10 @@ pub struct ClaudeRequest {
     pub permission_mode: Option<String>,
     /// `--append-system-prompt <text>`.
     pub append_system_prompt: Option<String>,
+    /// `--model <name>` (alias like `sonnet` or a full model id).
+    pub model: Option<String>,
+    /// `--effort <level>` (`low`, `medium`, `high`, …).
+    pub effort: Option<String>,
 }
 
 /// Spawn `claude -p <prompt> --output-format stream-json --verbose
@@ -30,17 +37,6 @@ pub fn run(request: ClaudeRequest, cancel: CancelToken) -> async_channel::Receiv
     let (emitter, rx) = Emitter::new(cancel);
     std::thread::spawn(move || run_blocking(request, emitter));
     rx
-}
-
-/// `~/x` → `$HOME/x`; anything else unchanged.
-fn expand_home(path: &str) -> String {
-    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home)
-            .join(rest)
-            .to_string_lossy()
-            .into_owned(),
-        _ => path.to_string(),
-    }
 }
 
 fn build_command(request: &ClaudeRequest) -> Command {
@@ -56,6 +52,22 @@ fn build_command(request: &ClaudeRequest) -> Command {
     }
     if let Some(mode) = request.permission_mode.as_deref().filter(|s| !s.is_empty()) {
         cmd.args(["--permission-mode", mode]);
+    }
+    if let Some(model) = request
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cmd.args(["--model", model]);
+    }
+    if let Some(effort) = request
+        .effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cmd.args(["--effort", effort]);
     }
     if let Some(text) = request
         .append_system_prompt
@@ -180,11 +192,42 @@ fn stderr_tail(stderr: &str) -> String {
     truncate(&lines[start..].join("\n"), 600)
 }
 
+/// Delta bookkeeping for the message an agent is currently streaming.
+#[derive(Default)]
+struct MessageState {
+    /// Id from the last `message_start`, when partial messages are on.
+    msg_id: Option<String>,
+    /// A `text_delta` was streamed for that message.
+    saw_text: bool,
+    /// A `thinking_delta` was streamed for that message.
+    saw_thinking: bool,
+}
+
 /// Turns stream-json lines into [`StreamEvent`]s.
 #[derive(Default)]
 struct Parser {
-    /// A `text_delta` was streamed for the current assistant message.
-    saw_delta: bool,
+    /// Per agent: `None` is the top level, `Some(id)` the subagent spawned
+    /// by tool call `id`.
+    states: HashMap<Option<String>, MessageState>,
+    /// `Agent`/`Task` tool_use ids already announced with `TaskStarted`.
+    tasks: HashSet<String>,
+    /// `system/task_*` task id → spawning tool_use id.
+    task_ids: HashMap<String, String>,
+}
+
+fn str_of<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+/// Inner events of a subagent are wrapped in `Sub`.
+fn wrap(parent: &Option<String>, event: StreamEvent) -> StreamEvent {
+    match parent {
+        Some(p) => StreamEvent::Sub {
+            parent: p.clone(),
+            event: Box::new(event),
+        },
+        None => event,
+    }
 }
 
 impl Parser {
@@ -196,99 +239,233 @@ impl Parser {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Vec::new();
         };
-        // Skip events from inside subagents (Task tool); only the top-level turn is shown.
-        if value
-            .get("parent_tool_use_id")
-            .is_some_and(|p| !p.is_null())
-        {
-            return Vec::new();
-        }
+        // Set on everything a subagent (spawned by that tool call) produces.
+        let parent = str_of(&value, "parent_tool_use_id").map(str::to_string);
         let str_at = |ptr: &str| value.pointer(ptr).and_then(Value::as_str);
         match str_at("/type").unwrap_or_default() {
-            "system" if str_at("/subtype") == Some("init") => str_at("/session_id")
-                .map(|id| vec![StreamEvent::SessionId(id.to_string())])
-                .unwrap_or_default(),
-            "stream_event" => match str_at("/event/type").unwrap_or_default() {
-                "message_start" => {
-                    self.saw_delta = false;
-                    Vec::new()
-                }
-                "content_block_delta" if str_at("/event/delta/type") == Some("text_delta") => {
-                    match str_at("/event/delta/text") {
-                        Some(text) if !text.is_empty() => {
-                            self.saw_delta = true;
-                            vec![StreamEvent::TextDelta(text.to_string())]
-                        }
-                        _ => Vec::new(),
+            "system" => self.system(&value, &parent),
+            "stream_event" => {
+                let state = self.states.entry(parent.clone()).or_default();
+                match str_at("/event/type").unwrap_or_default() {
+                    "message_start" => {
+                        *state = MessageState {
+                            msg_id: str_at("/event/message/id").map(str::to_string),
+                            ..MessageState::default()
+                        };
+                        Vec::new()
                     }
-                }
-                _ => Vec::new(),
-            },
-            "assistant" => {
-                let mut events = Vec::new();
-                for block in content_blocks(&value) {
-                    match block.get("type").and_then(Value::as_str) {
-                        Some("text") if !self.saw_delta => {
-                            if let Some(text) = block.get("text").and_then(Value::as_str)
-                                && !text.is_empty()
-                            {
-                                events.push(StreamEvent::TextDelta(text.to_string()));
+                    "content_block_delta" => match str_at("/event/delta/type") {
+                        Some("text_delta") => match str_at("/event/delta/text") {
+                            Some(text) if !text.is_empty() => {
+                                state.saw_text = true;
+                                vec![wrap(&parent, StreamEvent::TextDelta(text.to_string()))]
                             }
-                        }
-                        Some("tool_use") => {
-                            let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                            let input = block.get("input").cloned().unwrap_or(Value::Null);
-                            events.push(StreamEvent::ToolUse {
-                                name: name.to_string(),
-                                summary: tool_summary(name, &input),
-                            });
-                        }
-                        _ => {}
-                    }
+                            _ => Vec::new(),
+                        },
+                        Some("thinking_delta") => match str_at("/event/delta/thinking") {
+                            Some(text) if !text.is_empty() => {
+                                state.saw_thinking = true;
+                                vec![wrap(&parent, StreamEvent::Thinking(text.to_string()))]
+                            }
+                            _ => Vec::new(),
+                        },
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
                 }
-                // Each assistant event closes one message; the next starts fresh.
-                self.saw_delta = false;
-                events
             }
+            "assistant" => self.assistant(&value, &parent),
             "user" => content_blocks(&value)
-                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-                .map(|b| StreamEvent::ToolResult {
-                    summary: result_summary(b.get("content").unwrap_or(&Value::Null)),
-                    is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                .filter(|b| str_of(b, "type") == Some("tool_result"))
+                .map(|b| {
+                    let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                    match str_of(b, "tool_use_id").filter(|id| self.tasks.contains(*id)) {
+                        // A subagent returned; the notification carries its summary.
+                        Some(id) => StreamEvent::TaskUpdated {
+                            tool_use_id: id.to_string(),
+                            status: if is_error { "failed" } else { "completed" }.into(),
+                            summary: None,
+                        },
+                        None => wrap(
+                            &parent,
+                            StreamEvent::ToolResult {
+                                summary: result_summary(b.get("content").unwrap_or(&Value::Null)),
+                                is_error,
+                            },
+                        ),
+                    }
                 })
                 .collect(),
-            "result" => {
-                let is_error = value
-                    .get("is_error")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let subtype = str_at("/subtype").unwrap_or("error");
-                if is_error || subtype != "success" {
-                    let text = str_at("/result")
-                        .filter(|t| !t.trim().is_empty())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            value.get("errors").and_then(Value::as_array).map(|errs| {
-                                errs.iter()
-                                    .map(|e| {
-                                        e.as_str()
-                                            .map(str::to_string)
-                                            .unwrap_or_else(|| e.to_string())
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            })
-                        })
-                        .filter(|t| !t.trim().is_empty())
-                        .unwrap_or_else(|| subtype.to_string());
-                    vec![StreamEvent::Error(format!("Claude Code: {text}"))]
-                } else {
-                    vec![StreamEvent::Done]
+            "result" if parent.is_none() => result_event(&value),
+            _ => Vec::new(),
+        }
+    }
+
+    fn system(&mut self, value: &Value, parent: &Option<String>) -> Vec<StreamEvent> {
+        match str_of(value, "subtype").unwrap_or_default() {
+            "init" => {
+                let mut events = Vec::new();
+                if let Some(id) = str_of(value, "session_id") {
+                    events.push(StreamEvent::SessionId(id.to_string()));
                 }
+                let mut seen = HashSet::new();
+                let names: Vec<String> = ["slash_commands", "skills"]
+                    .iter()
+                    .filter_map(|k| value.get(*k).and_then(Value::as_array))
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|n| n.trim().trim_start_matches('/'))
+                    .filter(|n| !n.is_empty() && seen.insert(n.to_string()))
+                    .map(str::to_string)
+                    .collect();
+                if !names.is_empty() {
+                    events.push(StreamEvent::Commands(names));
+                }
+                events
+            }
+            "task_started" => {
+                let Some(tool_use_id) = str_of(value, "tool_use_id") else {
+                    return Vec::new();
+                };
+                if let Some(task_id) = str_of(value, "task_id") {
+                    self.task_ids
+                        .insert(task_id.to_string(), tool_use_id.to_string());
+                }
+                if !self.tasks.insert(tool_use_id.to_string()) {
+                    return Vec::new();
+                }
+                vec![StreamEvent::TaskStarted {
+                    tool_use_id: tool_use_id.to_string(),
+                    parent: parent.clone(),
+                    description: str_of(value, "description").unwrap_or_default().to_string(),
+                    agent_type: str_of(value, "subagent_type")
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("general-purpose")
+                        .to_string(),
+                    prompt: str_of(value, "prompt").unwrap_or_default().to_string(),
+                }]
+            }
+            "task_updated" => {
+                let tool_use_id = str_of(value, "task_id").and_then(|t| self.task_ids.get(t));
+                let status = value.pointer("/patch/status").and_then(Value::as_str);
+                match (tool_use_id, status) {
+                    (Some(id), Some(status)) => vec![StreamEvent::TaskUpdated {
+                        tool_use_id: id.clone(),
+                        status: status.to_string(),
+                        summary: None,
+                    }],
+                    _ => Vec::new(),
+                }
+            }
+            "task_notification" => {
+                let tool_use_id = str_of(value, "tool_use_id")
+                    .map(str::to_string)
+                    .or_else(|| {
+                        str_of(value, "task_id").and_then(|t| self.task_ids.get(t).cloned())
+                    });
+                let (Some(tool_use_id), Some(status)) = (tool_use_id, str_of(value, "status"))
+                else {
+                    return Vec::new();
+                };
+                vec![StreamEvent::TaskUpdated {
+                    tool_use_id,
+                    status: status.to_string(),
+                    summary: str_of(value, "summary")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                }]
             }
             _ => Vec::new(),
         }
     }
+
+    fn assistant(&mut self, value: &Value, parent: &Option<String>) -> Vec<StreamEvent> {
+        let state = self.states.entry(parent.clone()).or_default();
+        // Deltas count only for the message they were streamed for.
+        let msg_id = value.pointer("/message/id").and_then(Value::as_str);
+        let same = msg_id.is_none() || state.msg_id.as_deref() == msg_id;
+        let (saw_text, saw_thinking) = (same && state.saw_text, same && state.saw_thinking);
+        let mut events = Vec::new();
+        for block in content_blocks(value) {
+            match str_of(block, "type") {
+                Some("text") if !saw_text => {
+                    if let Some(text) = str_of(block, "text").filter(|t| !t.is_empty()) {
+                        events.push(wrap(parent, StreamEvent::TextDelta(text.to_string())));
+                    }
+                }
+                Some("thinking") if !saw_thinking => {
+                    // Redacted thinking has only a signature: nothing to show.
+                    if let Some(text) = str_of(block, "thinking").filter(|t| !t.trim().is_empty()) {
+                        events.push(wrap(parent, StreamEvent::Thinking(text.to_string())));
+                    }
+                }
+                Some("tool_use") => {
+                    let name = str_of(block, "name").unwrap_or("tool");
+                    let input = block.get("input").cloned().unwrap_or(Value::Null);
+                    match str_of(block, "id") {
+                        Some(id) if matches!(name, "Agent" | "Task") => {
+                            if self.tasks.insert(id.to_string()) {
+                                events.push(StreamEvent::TaskStarted {
+                                    tool_use_id: id.to_string(),
+                                    parent: parent.clone(),
+                                    description: str_of(&input, "description")
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    agent_type: str_of(&input, "subagent_type")
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or("general-purpose")
+                                        .to_string(),
+                                    prompt: str_of(&input, "prompt")
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                });
+                            }
+                        }
+                        _ => events.push(wrap(
+                            parent,
+                            StreamEvent::ToolUse {
+                                name: name.to_string(),
+                                summary: tool_summary(name, &input),
+                            },
+                        )),
+                    }
+                }
+                _ => {}
+            }
+        }
+        events
+    }
+}
+
+/// The top-level `result` event: `Done`, or `Error` with the best message.
+fn result_event(value: &Value) -> Vec<StreamEvent> {
+    let is_error = value
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let subtype = str_of(value, "subtype").unwrap_or("error");
+    if !is_error && subtype == "success" {
+        return vec![StreamEvent::Done];
+    }
+    let text = str_of(value, "result")
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value.get("errors").and_then(Value::as_array).map(|errs| {
+                errs.iter()
+                    .map(|e| {
+                        e.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| e.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        })
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| subtype.to_string());
+    vec![StreamEvent::Error(format!("Claude Code: {text}"))]
 }
 
 fn content_blocks(value: &Value) -> impl Iterator<Item = &Value> {
@@ -299,63 +476,37 @@ fn content_blocks(value: &Value) -> impl Iterator<Item = &Value> {
         .flatten()
 }
 
-/// One-line description of a tool call.
-fn tool_summary(name: &str, input: &Value) -> String {
-    let field = match name {
-        "Bash" => Some("command"),
-        "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => Some("file_path"),
-        "Grep" | "Glob" => Some("pattern"),
-        "WebFetch" => Some("url"),
-        "WebSearch" => Some("query"),
-        _ => None,
-    };
-    let text = field
-        .and_then(|f| input.get(f))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| match input {
-            Value::Null => String::new(),
-            other => other.to_string(),
-        });
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate(&one_line, 80)
-}
-
-/// First non-empty line of a tool result (`content` is a string or text blocks).
-fn result_summary(content: &Value) -> String {
-    let text = match content {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    };
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or_default();
-    truncate(line, 80)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const PLAIN: &str = include_str!("testdata/claude1.jsonl");
     const TOOL: &str = include_str!("testdata/claude2.jsonl");
+    const SUBAGENT: &str = include_str!("testdata/claude3.jsonl");
+    const NESTED: &str = include_str!("testdata/claude4.jsonl");
 
     fn parse_all(text: &str) -> Vec<StreamEvent> {
         let mut parser = Parser::default();
         text.lines().flat_map(|l| parser.feed(l)).collect()
     }
 
+    /// Events without the (long) `Commands` list of a real `system/init`.
+    fn parse_no_commands(text: &str) -> Vec<StreamEvent> {
+        let events = parse_all(text);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Commands(names) if names.iter().any(|n| n == "clear")
+        )));
+        events
+            .into_iter()
+            .filter(|e| !matches!(e, StreamEvent::Commands(_)))
+            .collect()
+    }
+
     #[test]
     fn plain_reply() {
         assert_eq!(
-            parse_all(PLAIN),
+            parse_no_commands(PLAIN),
             vec![
                 StreamEvent::SessionId("ae00ee0a-9769-436b-8644-58d50c9ce3d4".into()),
                 StreamEvent::TextDelta("Hi there, fri".into()),
@@ -367,7 +518,7 @@ mod tests {
 
     #[test]
     fn tool_call() {
-        let events = parse_all(TOOL);
+        let events = parse_no_commands(TOOL);
         assert_eq!(
             events,
             vec![
@@ -437,6 +588,184 @@ mod tests {
         assert!(p.feed("not json").is_empty());
     }
 
+    fn sub(parent: &str, event: StreamEvent) -> StreamEvent {
+        StreamEvent::Sub {
+            parent: parent.into(),
+            event: Box::new(event),
+        }
+    }
+
+    fn task_updated(id: &str, status: &str, summary: Option<&str>) -> StreamEvent {
+        StreamEvent::TaskUpdated {
+            tool_use_id: id.into(),
+            status: status.into(),
+            summary: summary.map(str::to_string),
+        }
+    }
+
+    /// Real capture (CLI 2.1.310, no partial messages) of one Agent call.
+    #[test]
+    fn subagent_capture() {
+        const AGENT: &str = "toolu_016GadyR8RAQ953kKXR5XPZt";
+        assert_eq!(
+            parse_all(SUBAGENT),
+            vec![
+                StreamEvent::SessionId("14d5d802-b58e-44d0-abe3-e1e4cc9862e0".into()),
+                StreamEvent::Commands(
+                    [
+                        "find-skills",
+                        "swarm",
+                        "tempad-dev:figma-canvas-authoring",
+                        "clear",
+                        "compact",
+                        "model",
+                        "dataviz",
+                        "anthropic-skills:pdf",
+                        "code-review",
+                    ]
+                    .map(String::from)
+                    .to_vec()
+                ),
+                StreamEvent::TaskStarted {
+                    tool_use_id: AGENT.into(),
+                    parent: None,
+                    description: "ZEBRAMARKER probe".into(),
+                    agent_type: "general-purpose".into(),
+                    prompt: "Look at your own system prompt. Does it contain the word \
+                             ZEBRAMARKER? Reply only YES or NO."
+                        .into(),
+                },
+                task_updated(AGENT, "completed", None),
+                task_updated(AGENT, "completed", Some("NO")),
+                task_updated(AGENT, "completed", None),
+                StreamEvent::TextDelta("The subagent answered: **NO**.".into()),
+                StreamEvent::Done,
+            ]
+        );
+    }
+
+    /// Partial messages with thinking, a subagent with tools, and a nested subagent.
+    #[test]
+    fn nested_subagents() {
+        const A: &str = "toolu_01AgentAAAAAAAAAAAAAAAA";
+        const B: &str = "toolu_01AgentBBBBBBBBBBBBBBBB";
+        assert_eq!(
+            parse_all(NESTED),
+            vec![
+                StreamEvent::SessionId("5b1c2f0e-8d7a-4c39-9e61-2a4f0c7d9b13".into()),
+                StreamEvent::Commands(
+                    ["review", "clear", "compact", "anthropic-skills:pdf"]
+                        .map(String::from)
+                        .to_vec()
+                ),
+                StreamEvent::Thinking("Let me ".into()),
+                StreamEvent::Thinking("plan.".into()),
+                StreamEvent::TextDelta("I'll dele".into()),
+                StreamEvent::TextDelta("gate.".into()),
+                StreamEvent::TaskStarted {
+                    tool_use_id: A.into(),
+                    parent: None,
+                    description: "Explore repo".into(),
+                    agent_type: "Explore".into(),
+                    prompt: "List the files.".into(),
+                },
+                sub(A, StreamEvent::TextDelta("Checking.".into())),
+                sub(
+                    A,
+                    StreamEvent::ToolUse {
+                        name: "Bash".into(),
+                        summary: "ls -la".into()
+                    }
+                ),
+                sub(
+                    A,
+                    StreamEvent::ToolResult {
+                        summary: "Cargo.toml".into(),
+                        is_error: false
+                    }
+                ),
+                sub(A, StreamEvent::Thinking("Need more detail.".into())),
+                StreamEvent::TaskStarted {
+                    tool_use_id: B.into(),
+                    parent: Some(A.into()),
+                    description: "Read src".into(),
+                    agent_type: "general-purpose".into(),
+                    prompt: "Summarize src/.".into(),
+                },
+                sub(B, StreamEvent::TextDelta("src has main.rs.".into())),
+                task_updated(B, "completed", None),
+                task_updated(B, "completed", Some("src has main.rs.")),
+                task_updated(B, "completed", None),
+                sub(A, StreamEvent::TextDelta("Done exploring.".into())),
+                task_updated(A, "completed", None),
+                task_updated(A, "completed", None),
+                StreamEvent::Thinking("Summarize.".into()),
+                StreamEvent::TextDelta("All good.".into()),
+                StreamEvent::Done,
+            ]
+        );
+    }
+
+    #[test]
+    fn task_started_without_tool_use_and_failed_task() {
+        let mut p = Parser::default();
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_X","description":"bg job","prompt":"do it"}"#;
+        assert_eq!(
+            p.feed(started),
+            vec![StreamEvent::TaskStarted {
+                tool_use_id: "toolu_X".into(),
+                parent: None,
+                description: "bg job".into(),
+                agent_type: "general-purpose".into(),
+                prompt: "do it".into(),
+            }]
+        );
+        assert!(p.feed(started).is_empty());
+        let updated = r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"killed"}}"#;
+        assert_eq!(
+            p.feed(updated),
+            vec![task_updated("toolu_X", "killed", None)]
+        );
+        let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_X","content":"boom","is_error":true}]},"parent_tool_use_id":null}"#;
+        assert_eq!(
+            p.feed(result),
+            vec![task_updated("toolu_X", "failed", None)]
+        );
+    }
+
+    #[test]
+    fn model_and_effort_args() {
+        let mut request = ClaudeRequest {
+            bin: "claude".into(),
+            prompt: "hi".into(),
+            cwd: std::env::temp_dir(),
+            resume: None,
+            permission_mode: None,
+            append_system_prompt: None,
+            model: Some("sonnet".into()),
+            effort: Some("high".into()),
+        };
+        let args = |r: &ClaudeRequest| -> Vec<String> {
+            build_command(r)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let got = args(&request);
+        assert!(
+            got.windows(2).any(|w| w == ["--model", "sonnet"]),
+            "{got:?}"
+        );
+        assert!(got.windows(2).any(|w| w == ["--effort", "high"]), "{got:?}");
+        request.model = Some(" ".into());
+        request.effort = None;
+        let got = args(&request);
+        assert!(
+            !got.iter().any(|a| a == "--model" || a == "--effort"),
+            "{got:?}"
+        );
+    }
+
     #[test]
     fn missing_binary() {
         let rx = run(
@@ -447,6 +776,8 @@ mod tests {
                 resume: None,
                 permission_mode: None,
                 append_system_prompt: None,
+                model: None,
+                effort: None,
             },
             CancelToken::new(),
         );
@@ -473,6 +804,8 @@ mod tests {
             resume,
             permission_mode: None,
             append_system_prompt: None,
+            model: None,
+            effort: None,
         };
         let t = std::time::Instant::now();
         let events = collect(run(req("Say hi in 3 words.", None), CancelToken::new()));
@@ -507,6 +840,8 @@ mod tests {
                 resume: None,
                 permission_mode: None,
                 append_system_prompt: None,
+                model: None,
+                effort: None,
             },
             cancel.clone(),
         );
