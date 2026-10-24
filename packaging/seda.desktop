@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Seda
+Name[fa]=صدا
+GenericName=Persian voice chat
+GenericName[fa]=گفت‌وگوی صوتی فارسی
+Comment=Chat by voice in Persian with a cloned voice
+Comment[fa]=گفت‌وگوی صوتی به فارسی با صدای شبیه‌سازی‌شده
+Exec=seda
+Icon=seda
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=voice;speech;tts;persian;farsi;chat;clone;
+Keywords[fa]=صدا;گفتار;فارسی;گفت‌وگو;چت;شبیه‌سازی;
+StartupWMClass=seda
+StartupNotify=true

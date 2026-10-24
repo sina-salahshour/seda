@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Seda</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14b8a6"/>
+      <stop offset="0.55" stop-color="#0f6f8f"/>
+      <stop offset="1" stop-color="#3b2a9a"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.3" cy="0.2" r="0.8">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="fg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d9f3f1"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fde68a"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+  </defs>
+
+  <!-- squircle background, 8px margin -->
+  <path d="M128 8 C 226 8 248 30 248 128 C 248 226 226 248 128 248 C 30 248 8 226 8 128 C 8 30 30 8 128 8 Z" fill="url(#bg)"/>
+  <path d="M128 8 C 226 8 248 30 248 128 C 248 226 226 248 128 248 C 30 248 8 226 8 128 C 8 30 30 8 128 8 Z" fill="url(#glow)"/>
+
+  <!-- waveform bars -->
+  <g fill="url(#fg)">
+    <rect x="49"  y="100" width="24" height="52"  rx="12"/>
+    <rect x="85"  y="66"  width="24" height="112" rx="12"/>
+    <rect x="121" y="40"  width="24" height="148" rx="12"/>
+    <rect x="157" y="74"  width="24" height="100" rx="12"/>
+    <rect x="193" y="104" width="24" height="44"  rx="12"/>
+  </g>
+
+  <!-- calligraphic kashida swash: tapered reed-pen stroke, thick in the middle -->
+  <path d="M34 176
+           C 62 206, 160 214, 222 184
+           L 232 176
+           C 230 196, 214 210, 190 218
+           C 128 236, 64 222, 34 176 Z"
+        fill="url(#gold)"/>
+  <!-- nuqta: reed-pen rhombus dot -->
+  <path d="M200 42 L 218 54 L 206 72 L 188 60 Z" fill="url(#gold)"/>
+</svg>
